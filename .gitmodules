@@ -1,0 +1,9 @@
+[submodule "orchestrator"]
+	path = orchestrator
+	url = ./orchestrator
+[submodule "agent"]
+	path = agent
+	url = ./agent
+[submodule "browser"]
+	path = browser
+	url = ./browser
