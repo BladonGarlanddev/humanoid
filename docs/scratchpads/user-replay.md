@@ -3,7 +3,7 @@
 ## Current Status
 **Step 1 (Telegram notification service) — COMPLETE.**
 **Step 2 (Agent detection + handoff signal) — COMPLETE. Smoke-tested 2026-02-22.**
-**Step 3 (Record + Replay) — not yet started.**
+**Step 3 (Record + Replay) — PLANNED. Ready to implement. See "Step 3 Implementation Plan" below.**
 
 ---
 
@@ -41,6 +41,21 @@ Automations are saved, parameterized sequences of the same tool calls the LLM ag
 - React checks setting before calling `window.electron.showTray()`
 - Telegram notification is always sent (not tied to this setting)
 
+### Recording mechanism (how capture actually works)
+Recording is agent-transparent and purely server-side. When `context.automationRecording.isRecording === true`:
+- Every tool call executed by `AgentService.executeTool()` (line ~504) calls `this.recordAction(ctx, toolName, args, result)`
+- `recordAction` appends `{ tool, args, result, timestamp }` to `ctx.automationRecording.recordedActions[]`
+- Meta-tools (START/STOP/LIST/INVOKE AUTOMATION) are skipped
+- No browser-side content script injection is needed for the agent-recording path
+- The `automation-discovery.service.ts` path (post-execution analysis) uses an LLM to analyze existing chat history
+
+### Two paths to create automations
+1. **Live recording**: Agent calls START_RECORDING → performs actions → calls STOP_RECORDING → `AutomationAnalyzerService.analyzeRecording()` parameterizes the recorded steps → saved to DB
+2. **Post-execution discovery**: User opens CreateAutomationModal → selects task run → POST /automations/discover → `AutomationDiscoveryService` runs LLM agent over chat history → automations extracted and saved to DB
+
+### Event routing for automation tools
+Automation tools emit `context.emitEvent('createAutomation', payload)` and `context.emitEvent('invokeAutomation', payload)`. These MUST be intercepted in the orchestration service's event sink closure (same pattern as Telegram for ACTION_REQUIRED) and handled server-side WITHOUT forwarding to the React UI. The React UI round-trip was never implemented and would be fragile.
+
 ---
 
 ## Open Questions
@@ -54,7 +69,7 @@ Automations are saved, parameterized sequences of the same tool calls the LLM ag
 
 1. ✅ **Telegram notification service** — `backend/src/telegram/` — DONE
 2. ✅ **Agent detection + handoff signal** — DONE, smoke-tested 2026-02-22
-3. **Record + Replay** — content script injection for capture, tool-call-based replay, Automation Prisma model
+3. **Record + Replay** — READY TO IMPLEMENT (see Step 3 plan below)
 4. **Cloudflare/fingerprinting improvements** — reduce how often 1-3 are needed
 
 ---
@@ -97,6 +112,220 @@ Remaining manual verification: UI banner render + Electron tray notification (re
 
 ---
 
+## Step 3 — Implementation Plan
+
+### Context
+Phase 3 infrastructure (Prisma models, agent tools, orchestration service handlers, AutomationAnalyzerService, AutomationsModule/Controller/Service, React UI screens, CreateAutomationModal, discovery flow) was **written speculatively and is largely in place**. Two runtime bugs and two TypeScript errors prevent the system from functioning.
+
+**DO NOT re-research the codebase — all gaps are identified below. Implement the 4 fixes.**
+
+---
+
+### Existing architecture (do not change)
+
+**Prisma models** — `backend/prisma/schema.prisma` — both `Automation` and `AutomationExecution` tables are in the init migration (`20260213052037_init`) and are already applied to the DB.
+
+**Agent tools** — `backend/src/agent/tools/automation.tool.ts`:
+- `START_RECORDING_AUTOMATION` — sets `context.automationRecording = { isRecording: true, name, expectedParams, recordedActions: [] }`
+- `STOP_RECORDING_AUTOMATION` — calls `context.emitEvent('createAutomation', { runId, recording, currentDomain })`; awaits `AUTOMATION_CREATED` internal event (30 s)
+- `LIST_AUTOMATIONS` — queries `prisma.automation.findMany({ where: { pageId: context.pageTypeId } })`
+- `INVOKE_AUTOMATION` — calls `context.emitEvent('invokeAutomation', { runId, automationId, parameters })`; awaits `AUTOMATION_EXECUTED` internal event (60 s)
+
+**Recording capture** — `backend/src/agent/agent.service.ts` ~line 504:
+```ts
+if (ctx.automationRecording?.isRecording) {
+  this.recordAction(ctx, toolName, args, result);
+}
+```
+Every tool call (except the 4 automation meta-tools) is captured automatically. No browser changes needed.
+
+**Orchestration handlers** — `backend/src/agent/agent-orchestration.service.ts`:
+- `handleCreateAutomation(payload)` at line ~840 — analyzes recording, upserts PageType, creates Automation, emits `AUTOMATION_CREATED`
+- `handleInvokeAutomation(payload)` at line ~929 — loads automation, calls `automationAnalyzer.executeAutomation()`, logs AutomationExecution, emits `AUTOMATION_EXECUTED`
+- `handleStateUpdate()` at line 495 has switch cases for `CREATE_AUTOMATION` and `INVOKE_AUTOMATION` (reachable via gateway STATE_UPDATE from React UI — NOT the path we'll use)
+
+**AutomationAnalyzerService** — `backend/src/agent/automation-analyzer.service.ts`:
+- `analyzeRecording(actions, expectedParams)` — extracts param values, builds param definitions, parameterizes steps
+- `executeAutomation(steps, parameters, context)` — has bug (see Gap 2 below)
+
+**AutomationsModule** — `backend/src/automations/`:
+- `automations.module.ts` — imports `[PrismaModule, AgentModule]`, provides `AutomationsService`, imported by `app.module.ts` ✅
+- `automations.controller.ts` — `GET /automations`, `GET /automations/:id`, `POST /automations`, `PATCH /automations/:id`, `DELETE /automations/:id`, `POST /automations/discover`, `POST /automations/:id/increment-usage`
+- `automations.service.ts` — CRUD
+
+**AutomationDiscoveryService** — `backend/src/agent/automation-discovery.service.ts`:
+- Entry point for `POST /automations/discover`
+- Runs `runAutomationDiscoveryAgent` (LLM loop with SAVE_AUTOMATION + FINISH_DISCOVERY tools)
+- Persists discovered automations to DB
+
+**React UI**:
+- `orchestrator/react-ui/src/screens/Automations/Automations.tsx` — list + detail pane, CreateAutomationModal trigger
+- `orchestrator/react-ui/src/screens/Automations/CreateAutomationModal/CreateAutomationModel.tsx` — 3-step wizard (website → task → runs) + discovery + results. `onRunSelected` prop removed internally; handles itself.
+- `orchestrator/react-ui/src/hooks/useAutomations.ts` — TanStack Query hooks for list, detail, KPIs, execute, reset mutations
+- `orchestrator/react-ui/src/hooks/useDiscovery.ts` — `useStartDiscovery()` mutation for POST /automations/discover
+- `orchestrator/react-ui/src/api/automations.api.ts` — API calls (note: kpis/execute/reset endpoints don't exist on backend yet)
+- `orchestrator/react-ui/src/types/automations.types.d.ts` — `Automation`, `AutomationStep`, `AutomationParameter`, `AutomationsQueryParams`, `PaginatedResponse`, `ApiResponse` types
+
+---
+
+### Gap 1 — Event sink doesn't route `createAutomation` / `invokeAutomation` (CRITICAL)
+
+**File:** `backend/src/agent/agent-orchestration.service.ts`, `createContext()` lines ~318–332
+
+**Problem:** Event sink forwards everything to `gateway.emitEvent()` (Socket.io → React UI). React UI has no handler for `createAutomation`/`invokeAutomation`. They disappear. Tools time out.
+
+**Fix:** In the `events.emit` closure, add early-return intercepts for these two event names:
+
+```ts
+emit: (eventName: string, payload: any) => {
+  if (eventName === 'runUpdate' && payload?.kind === 'ACTION_REQUIRED') {
+    this.telegramService
+      .sendMessage(`[Humanoid] Task needs your attention:\n${payload.reason}`)
+      .catch(() => {});
+  }
+  // Handle automation events server-side — no React UI round-trip
+  if (eventName === 'createAutomation') {
+    this.handleCreateAutomation(payload).catch((e) =>
+      console.error('[Orchestrator] createAutomation failed:', e),
+    );
+    return;
+  }
+  if (eventName === 'invokeAutomation') {
+    this.handleInvokeAutomation(payload).catch((e) =>
+      console.error('[Orchestrator] invokeAutomation failed:', e),
+    );
+    return;
+  }
+  gateway.emitEvent(runId, eventName, payload);
+},
+```
+
+---
+
+### Gap 2 — `executeAutomation` calls non-existent `context.executeTool()` (CRITICAL)
+
+**File A:** `backend/src/agent/automation-analyzer.service.ts` line ~167
+
+**Problem:** `await context.executeTool(step.tool, resolvedArgs)` — `TaskAgentContext` has no `executeTool` method. Runtime crash.
+
+**Fix:** Change `executeAutomation` signature to accept an executor callback:
+
+```ts
+async executeAutomation(
+  steps: any[],
+  parameters: Record<string, any>,
+  executeTool: (toolName: string, args: any) => Promise<any>,
+): Promise<{ success: boolean; error?: string }> {
+  for (const step of steps) {
+    const resolvedArgs = this.substituteParameters(step.args, parameters);
+    console.log(`[Automation] Step: ${step.tool}`, resolvedArgs);
+    try {
+      await executeTool(step.tool, resolvedArgs);
+    } catch (error) {
+      console.error(`[Automation] Step failed: ${step.tool}`, error);
+      return { success: false, error: `Step "${step.tool}" failed: ${error.message}` };
+    }
+  }
+  return { success: true };
+}
+```
+
+**File B:** `backend/src/agent/agent-orchestration.service.ts` — `handleInvokeAutomation` line ~950
+
+Change the `executeAutomation` call to pass an executor lambda:
+
+```ts
+const result = await this.automationAnalyzer.executeAutomation(
+  automation.steps as any[],
+  parameters,
+  (toolName, args) => this.agentService.forceToolCall({ context, toolName, args }),
+);
+```
+
+Note: `AgentService.forceToolCall` is already injected into orchestration service via `@Inject(forwardRef(() => AgentService))`.
+
+---
+
+### Gap 3 — `Automations.tsx` passes `onRunSelected` prop that doesn't exist (TypeScript error)
+
+**File:** `orchestrator/react-ui/src/screens/Automations/Automations.tsx`
+
+**Problem:** Line 98 passes `onRunSelected={handleRunSelected}` to `CreateAutomationModal`. The modal's `CreateAutomationModalProps` only has `onClose`. TypeScript error.
+
+**Fix:** Remove `handleRunSelected` function and `onRunSelected` prop from the JSX. The modal handles everything internally and calls `onClose` when done.
+
+Change:
+```tsx
+const handleRunSelected = (runId: string, taskId: string) => {
+  console.log("[CreateAutomation] run selected", { runId, taskId });
+  setShowCreateModal(false);
+};
+// ...
+<CreateAutomationModal
+  onClose={() => setShowCreateModal(false)}
+  onRunSelected={handleRunSelected}
+/>
+```
+To:
+```tsx
+<CreateAutomationModal onClose={() => setShowCreateModal(false)} />
+```
+
+---
+
+### Gap 4 — `useAutomations.ts` imports from non-existent file (TypeScript error)
+
+**File:** `orchestrator/react-ui/src/hooks/useAutomations.ts`
+
+**Problem:** Line 9: `import type { ..., AutomationKPIs, ... } from "../types/automation.types"` — wrong filename (singular). File is `automations.types.d.ts` (plural). `AutomationKPIs` is not defined in that file (KPI backend endpoint doesn't exist yet).
+
+**Fix:**
+1. Change import path to `"../types/automations.types"` (plural)
+2. Remove `AutomationKPIs` from import (and type the `getAutomationKPIs` return as `any` in the hook)
+
+---
+
+### Files to change (4 total)
+
+| # | File | Sub-project | Change |
+|---|------|-------------|--------|
+| 1 | `backend/src/agent/agent-orchestration.service.ts` | backend | Event sink: add createAutomation/invokeAutomation intercepts + fix executor arg in handleInvokeAutomation |
+| 2 | `backend/src/agent/automation-analyzer.service.ts` | backend | Change executeAutomation signature to accept executor callback |
+| 3 | `orchestrator/react-ui/src/screens/Automations/Automations.tsx` | orchestrator | Remove onRunSelected prop and no-op handler |
+| 4 | `orchestrator/react-ui/src/hooks/useAutomations.ts` | orchestrator | Fix import path + drop AutomationKPIs |
+
+---
+
+### Known gaps (out of scope for Phase 3)
+
+These backend endpoints are called by the UI but don't exist. They'll 404, but don't block core recording/replay:
+- `GET /automations/:id/kpis` — KPI widget in detail panel won't load
+- `POST /automations/:id/execute` — standalone execution button won't work
+- `POST /automations/:id/reset` — reset button won't work
+
+---
+
+### Verification
+
+**Backend:**
+```bash
+cd backend && pnpm lint && pnpm typecheck && pnpm test
+```
+
+**Orchestrator:**
+```bash
+cd orchestrator && pnpm typecheck
+```
+
+**End-to-end smoke (manual, requires running stack):**
+1. Start task run. Send: `"Record automation 'Search jobs' with params [job_title, location], navigate indeed.com, type 'Engineer' in search box, type 'Austin' in location, stop recording."`
+2. Verify `Automation` record in DB (`npx prisma studio`)
+3. New run: `"List automations, invoke Search jobs with job_title=Developer, location=Seattle"`
+4. Verify `AutomationExecution` record created, `usageCount` incremented
+5. Open Automations screen → list loads → modal opens → select run → discover → results shown
+
+---
+
 ## Step 2 — Original Plan
 
 ### Architecture
@@ -129,110 +358,14 @@ Step 2 reuses this pattern exactly.
 | 15 | `orchestrator/orchestrator-electron/src/main.ts` | add ipcMain.handle('notifications:showTray') using Electron Notification API + win.flashFrame(true) |
 | 16 | `orchestrator/orchestrator-electron/src/preload.js` | expose window.electron = { showTray: (msg) => ipcRenderer.invoke('notifications:showTray', msg) } |
 
-### Key implementation details
-
-**notify-human.tool.ts:**
-```ts
-export const requestHumanIntervention = {
-  name: 'REQUEST_HUMAN_INTERVENTION',
-  description: 'Call when blocked by auth wall, Cloudflare, captcha. Pauses execution, notifies user, resumes after they signal done.',
-  parameters: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'] },
-  async execute({ reason }, context: TaskAgentContext) {
-    context.emitEvent('runUpdate', { kind: 'ACTION_REQUIRED', reason, runId: context.runId });
-    try {
-      const result = await context.waitForEvent('ACTION_RESOLVED', 10 * 60 * 1000);
-      return { success: true, resolved: true, ...result };
-    } catch {
-      return { success: false, timedOut: true, message: 'No response in 10 minutes. Continuing autonomously.' };
-    }
-  },
-};
-```
-
-**agent-orchestration.service.ts events sink intercept (lines ~311-318):**
-```ts
-emit: (eventName: string, payload: any) => {
-  if (eventName === 'runUpdate' && payload?.kind === 'ACTION_REQUIRED') {
-    this.telegramService
-      .sendMessage(`[Humanoid] Task needs your attention:\n${payload.reason}`)
-      .catch(() => {});
-  }
-  gateway.emitEvent(runId, eventName, payload);
-},
-```
-
-**AppSettings Prisma model:**
-```prisma
-model AppSettings {
-  key       String   @id
-  value     Json
-  updatedAt DateTime @updatedAt
-}
-```
-
-**Electron notification (main.ts):**
-```ts
-ipcMain.handle('notifications:showTray', (_event, message: string) => {
-  if (Notification.isSupported()) {
-    new Notification({ title: 'Humanoid — Action Required', body: message }).show();
-  }
-  win?.flashFrame(true);
-});
-```
-
-### Data flow
-```
-LLM calls REQUEST_HUMAN_INTERVENTION(reason)
-  → tool emits 'runUpdate' { kind: 'ACTION_REQUIRED', reason }
-    → orchestration events.emit: Telegram fire-and-forget + Socket.io broadcast
-    → React: sets actionRequired state → banner mounts
-      → if notificationsEnabled: window.electron.showTray(reason) → OS notification + taskbar flash
-  → tool awaits 'ACTION_RESOLVED' (10 min timeout)
-
-User resolves block, clicks "Done"
-  → React sends 'RESOLVE_ACTION_REQUIRED' { runId }
-  → Gateway: context.emitInternal('ACTION_RESOLVED', { resolved: true })
-  → tool unblocks → returns { success: true }
-  → LLM continues → React clears banner
-```
-
-### Verification
-```bash
-cd backend && npx prisma validate && npx prisma generate
-cd backend && pnpm lint && pnpm typecheck && pnpm test
-cd orchestrator && pnpm typecheck
-```
-
 ---
 
-## Sub-projects Affected
+## Sub-projects Affected (Phase 3)
 
 | Sub-project | Why |
 |---|---|
-| `backend/` | TelegramService (done), Automation model + CRUD endpoints, AppSettings model + module, agent tool, orchestration service, gateway |
-| `browser/src/index.ts` | Recording mode, event capture (Step 3 only) |
-| `orchestrator/react-ui` | In-app notification banner, record/stop controls, "done" button, settings toggle |
-| `orchestrator/orchestrator-electron` | OS tray notification |
-| `backend/src/agent/agent.service.ts` | Prompt update to detect and signal blocks; invoke automations (Step 3) |
-
-This crosses sub-project boundaries — plan must be approved before any code is written.
-
----
-
-## Deployment Model Discussion (2026-02-22)
-
-Three deployment phases identified:
-- **Phase 1 (now)**: Developer is sole consumer. Supporting services (credential vault, data storage) are called by the agent as tools.
-- **Phase 2 (near future)**: Developer builds products on top of the framework. Products call NestJS as an API. Users interact with the product, not the framework directly.
-- **Phase 3 (uncertain)**: End users run Electron + browser worker on their own machines; NestJS is a hosted service they pay to use.
-
-Phase 3 is not being designed for now but the architecture must not foreclose it. Key constraint: avoid global singletons in task/session state; prefer data models with a natural owner field even if unused today.
-
-MCP has two roles in this system:
-- NestJS as MCP **server** — exposes automation capabilities to external AI agents (openClaw)
-- NestJS as MCP **client** — connects to external tool servers (credential service, data service) and makes their tools available to the agent
-
-These premises are now encoded in CLAUDE.md under "Strategic Architecture Premises".
+| `backend/src/agent/` | Event sink fix + executor fix (2 files) |
+| `orchestrator/react-ui` | Remove invalid prop, fix import (2 files) |
 
 ---
 
@@ -250,3 +383,7 @@ _None yet._
 - `AppSettings` key-value table is general-purpose — reusable for future toggles (default model, Telegram on/off, etc.)
 - The `RESOLVE_ACTION_REQUIRED` socket event name is intentionally distinct from `STATE_UPDATE` / `TOOL_RESULT` to keep semantics clear
 - Timeout on `waitForEvent` is 10 minutes; on timeout the tool returns `{ timedOut: true }` and the LLM decides how to proceed
+- Recording is transparent — no browser-side script injection needed for live agent recording
+- Browser worker (`browser/src/index.ts`) does NOT need changes for Phase 3
+- `Automation.steps` are stored as `[{ tool: string, args: object }]` with `{paramName}` placeholders in variable args
+- `AutomationAnalyzerService.analyzeRecording()` only extracts params from `TYPE_INPUT` tool calls (heuristic-based)

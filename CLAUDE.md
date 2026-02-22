@@ -62,6 +62,27 @@ Browser scrape → PDR (page snapshot) → Vectorize → Cluster → Classify �
 
 ---
 
+## Strategic Architecture Premises
+
+These premises should inform future architectural decisions. They do not require immediate implementation but must not be designed against.
+
+### 1. API-first
+The backend must be callable by external systems — other services, AI agents, future products built on top of this framework — not just the React UI. Endpoint design should assume external consumers exist. Avoid patterns that only work when called from the orchestrator.
+
+### 2. MCP compatibility
+The agent tool system should be designed to accept tools from external MCP servers (e.g. a credential service, a data storage service). The framework itself should eventually be exposable as an MCP server so external AI agents (including openClaw) can drive it programmatically. Do not hardcode the tool surface as closed.
+
+### 3. Multi-tenancy awareness
+Do not build in assumptions that there is exactly one user, one browser worker, or one credential set. Do not engineer multi-tenancy now, but do not foreclose it. Avoid global singletons in task/session state, and prefer data models that have a natural owner/tenant field even if that field is unused today.
+
+### 4. Metering hooks
+Task execution events (created, started, completed, failed) should be structured so that a usage tracking or billing layer could consume them later. Do not build billing now. Do structure task lifecycle so the hooks exist.
+
+### Deployment model context
+The near-term model is: the developer (sole operator) builds products on top of the framework. Those products call the NestJS backend as an API. Supporting services (credential vault, data storage) are called by the agent as tools during task execution. A future model where end users run the Electron + browser worker on their own machines connected to a hosted backend is possible but not designed for yet.
+
+---
+
 ## Commands
 
 ### Backend (`backend/`)
