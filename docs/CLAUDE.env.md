@@ -12,6 +12,8 @@
 | `ANTHROPIC_API_KEY` | — | Anthropic models via LangChain |
 | `FIREWORKS_API_KEY` | — | Fireworks models via LangChain |
 | `COHERE_API_KEY` | — | Cohere models via LangChain |
+| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token for one-way notifications |
+| `TELEGRAM_CHAT_ID` | — | Target group/chat ID for Telegram notifications |
 
 ## Orchestrator Electron (`orchestrator/orchestrator-electron/.env`)
 

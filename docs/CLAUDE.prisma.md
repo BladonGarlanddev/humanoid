@@ -12,6 +12,12 @@ Schema: `backend/prisma/schema.prisma`
 
 **PdrStatus enum:** `SCRAPED → VECTORIZING → CLASSIFYING → TRAINING → READY | FAILED`
 
+## Settings model
+
+| Model | Key fields | Notes |
+|---|---|---|
+| `AppSettings` | `key String @id`, `value Json` | General-purpose key/value store. REST: `GET /settings/:key`, `PATCH /settings/:key`. Current keys: `notifications_electron_enabled (bool)`. |
+
 ## Task execution models
 
 | Model | Key fields | Notes |
