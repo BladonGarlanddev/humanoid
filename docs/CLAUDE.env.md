@@ -14,6 +14,7 @@
 | `COHERE_API_KEY` | — | Cohere models via LangChain |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token for one-way notifications |
 | `TELEGRAM_CHAT_ID` | — | Target group/chat ID for Telegram notifications |
+| `ALLOWED_ORIGINS` | *(see below)* | Comma-separated CORS origins for 3rd party access. If unset, defaults to `http://localhost:5173,http://localhost:3000,http://localhost:8050`. Example: `https://job-app.example.com,http://localhost:4000` |
 
 ## Orchestrator Electron (`orchestrator/orchestrator-electron/.env`)
 
